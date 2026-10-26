@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- magnifier handle -->
+    <path d="M308 308 L424 424" stroke="#0E1116" stroke-width="54" />
+    <!-- magnifier lens -->
+    <circle cx="214" cy="214" r="130" stroke="#0E1116" stroke-width="42" />
+    <!-- contract check inside the lens -->
+    <path d="M166 216 L202 252 L268 180" stroke="#12B76A" stroke-width="34" />
+  </g>
+</svg>
