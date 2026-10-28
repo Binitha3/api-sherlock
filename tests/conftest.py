@@ -18,6 +18,7 @@ os.environ.setdefault("ALLOW_PRIVATE_HOSTS", "false")
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app.core import security  # noqa: E402
 from app.db.base import Base  # noqa: E402
 from app.db.session import get_engine  # noqa: E402
 from app.main import app  # noqa: E402
@@ -97,6 +98,11 @@ components:
         message:
           type: string
 """
+
+
+@pytest.fixture(autouse=True)
+def allow_public_test_host_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(security, "resolve_target_ips", lambda host, port: ["93.184.216.34"])
 
 
 @pytest.fixture()

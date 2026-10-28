@@ -1,0 +1,103 @@
+openapi: 3.0.3
+info:
+  title: API Sherlock Demo API
+  version: 1.0.0
+servers:
+  - url: http://127.0.0.1:8001
+paths:
+  /health:
+    get:
+      operationId: health
+      responses:
+        '200':
+          description: Health response
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, version]
+                properties:
+                  status: {type: string}
+                  version: {type: string}
+  /users/{user_id}:
+    get:
+      operationId: getUser
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema: {type: string}
+          example: u-1
+      responses:
+        '200':
+          description: A user
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, name, active]
+                properties:
+                  id: {type: string}
+                  name: {type: string}
+                  active: {type: boolean}
+  /users:
+    get:
+      operationId: listUsers
+      parameters:
+        - name: limit
+          in: query
+          schema: {type: integer, default: 10}
+      responses:
+        '200':
+          description: User list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, limit]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, name, active]
+                      properties:
+                        id: {type: string}
+                        name: {type: string}
+                        active: {type: boolean}
+                  limit: {type: integer}
+  /account:
+    get:
+      operationId: getAccount
+      security:
+        - bearerAuth: []
+        - demoKey: []
+      responses:
+        '200':
+          description: Account details
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, owner, status]
+                properties:
+                  id: {type: string}
+                  owner: {type: string}
+                  status: {type: string}
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail: {type: string}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    demoKey:
+      type: apiKey
+      in: header
+      name: X-Demo-Key

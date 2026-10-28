@@ -22,7 +22,8 @@ from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 from openapi_spec_validator import validate as validate_openapi
 
 from app.core.config import get_settings
-from app.core.errors import SpecInvalidError, UpstreamFetchError
+from app.core.errors import AppError, SpecInvalidError, UpstreamFetchError
+from app.core.security import assert_safe_url
 
 HTTP_METHODS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
 SUPPORTED_OPENAPI_MAJOR = ("3.0", "3.1")
@@ -377,36 +378,42 @@ def _check_url(url: str) -> None:
 
 
 async def fetch_document(url: str) -> tuple[bytes, str | None]:
-    """Fetch a document over HTTP with a timeout and size cap."""
+    """Fetch a document over HTTP with a timeout, size cap and per-hop SSRF checks."""
     _check_url(url)
     settings = get_settings()
     limit = settings.max_spec_bytes
+    current_url = url
     try:
-        async with (
-            httpx.AsyncClient(
-                timeout=settings.request_timeout_seconds,
-                follow_redirects=True,
-                headers={"User-Agent": "api-sherlock/0.1"},
-            ) as client,
-            client.stream("GET", url) as response,
-        ):
-            if response.status_code >= 400:
-                raise UpstreamFetchError(f"Spec URL returned HTTP {response.status_code}.")
-            buffer = bytearray()
-            async for chunk in response.aiter_bytes():
-                buffer += chunk
-                if len(buffer) > limit:
-                    raise SpecInvalidError(
-                        f"Spec document exceeds the {limit // (1024 * 1024)} MiB limit."
-                    )
-            content_type = response.headers.get("content-type")
-    except SpecInvalidError:
-        raise
-    except UpstreamFetchError:
+        async with httpx.AsyncClient(
+            timeout=settings.request_timeout_seconds,
+            follow_redirects=False,
+            trust_env=False,
+            headers={"User-Agent": "api-sherlock/0.1"},
+        ) as client:
+            for _ in range(6):
+                assert_safe_url(current_url)
+                async with client.stream("GET", current_url) as response:
+                    if response.is_redirect and response.headers.get("location"):
+                        current_url = str(response.url.join(response.headers["location"]))
+                        _check_url(current_url)
+                        continue
+                    if response.status_code >= 400:
+                        raise UpstreamFetchError(f"Spec URL returned HTTP {response.status_code}.")
+                    buffer = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        buffer.extend(chunk)
+                        if len(buffer) > limit:
+                            raise SpecInvalidError(
+                                f"Spec document exceeds the {limit // (1024 * 1024)} MiB limit."
+                            )
+                    content_type = response.headers.get("content-type")
+                    return bytes(buffer), content_type
+            raise UpstreamFetchError("Spec URL redirected more than 5 times.")
+    except (SpecInvalidError, UpstreamFetchError, AppError):
         raise
     except httpx.HTTPError as exc:
         raise UpstreamFetchError(f"Could not fetch spec URL: {exc.__class__.__name__}.") from exc
-    return bytes(buffer), content_type
+    raise UpstreamFetchError("Could not fetch spec URL.")
 
 
 # ---------------------------------------------------------------------------

@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel, Field, field_validator
+from fastapi import APIRouter, Depends, Request, Response
+from pydantic import BaseModel, Field, SecretStr, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import __version__
 from app.core.config import get_settings
 from app.core.errors import AppError, NotFoundError, SpecInvalidError
-from app.db.models import Project, Spec
+from app.db.models import Environment, Project, Run, RunResult, Spec
 from app.db.session import get_db
+from app.services.runner import AuthContext, run_operations
 from app.services.spec_import import fetch_document, import_document
 
 router = APIRouter()
@@ -197,3 +198,333 @@ def list_specs(project_id: str, db: Session = Depends(get_db)) -> dict[str, Any]
     project = _get_project(db, project_id)
     specs = sorted(project.specs, key=lambda s: s.created_at, reverse=True)
     return {"specs": [spec_to_dict(s) for s in specs]}
+
+
+# ---------------------------------------------------------------------------
+# Environments
+# ---------------------------------------------------------------------------
+
+
+AUTH_TYPES = {"none", "bearer", "api_key_header", "basic"}
+
+
+class EnvironmentCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    base_url: str = Field(min_length=1, max_length=2000)
+    auth_type: Literal["none", "bearer", "api_key_header", "basic"] = "none"
+    auth_header_name: str | None = Field(default=None, min_length=1, max_length=200)
+
+    @field_validator("name")
+    @classmethod
+    def _strip_environment_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("name must not be blank")
+        return value
+
+    @field_validator("base_url")
+    @classmethod
+    def _validate_base_url(cls, value: str) -> str:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(value.strip())
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("base_url must be an absolute http or https URL")
+        if parsed.username or parsed.password:
+            raise ValueError("base_url must not contain credentials")
+        return value.strip().rstrip("/")
+
+    @field_validator("auth_header_name")
+    @classmethod
+    def _validate_auth_header(cls, value: str | None) -> str | None:
+        if value is not None and ("\r" in value or "\n" in value):
+            raise ValueError("auth_header_name must not contain line breaks")
+        return value.strip() if value else None
+
+
+class EnvironmentUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    base_url: str | None = Field(default=None, min_length=1, max_length=2000)
+    auth_type: Literal["none", "bearer", "api_key_header", "basic"] | None = None
+    auth_header_name: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class RunAuth(BaseModel):
+    """Run-only auth input. These values are intentionally never persisted."""
+
+    token: SecretStr | None = None
+    api_key: SecretStr | None = None
+    username: SecretStr | None = None
+    password: SecretStr | None = None
+
+
+class RunCreate(BaseModel):
+    spec_id: str
+    environment_id: str
+    include_operations: list[str] | None = None
+    parameter_values: dict[str, dict[str, Any]] | None = None
+    auth: RunAuth | None = None
+
+
+def environment_to_dict(environment: Environment) -> dict[str, Any]:
+    return {
+        "id": environment.id,
+        "project_id": environment.project_id,
+        "name": environment.name,
+        "base_url": environment.base_url,
+        "auth_type": environment.auth_type,
+        "auth_header_name": environment.auth_header_name,
+        "created_at": _iso(environment.created_at),
+    }
+
+
+def _get_environment(db: Session, project_id: str, environment_id: str) -> Environment:
+    environment = db.scalar(
+        select(Environment).where(
+            Environment.id == environment_id,
+            Environment.project_id == project_id,
+        )
+    )
+    if environment is None:
+        raise NotFoundError(f"Environment '{environment_id}' not found.")
+    return environment
+
+
+def _clean_environment_update(payload: EnvironmentUpdate) -> dict[str, Any]:
+    changes = payload.model_dump(exclude_unset=True)
+    if "name" in changes:
+        name = changes["name"].strip()
+        if not name:
+            raise AppError("Environment name must not be blank.", code="request_invalid")
+        changes["name"] = name
+    if "base_url" in changes and changes["base_url"] is not None:
+        changes["base_url"] = EnvironmentCreate._validate_base_url(changes["base_url"])
+    if "auth_header_name" in changes and changes["auth_header_name"] is not None:
+        changes["auth_header_name"] = EnvironmentCreate._validate_auth_header(
+            changes["auth_header_name"]
+        )
+    return changes
+
+
+@router.post("/projects/{project_id}/environments", status_code=201, tags=["environments"])
+def create_environment(
+    project_id: str, payload: EnvironmentCreate, db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    project = _get_project(db, project_id)
+    environment = Environment(project_id=project.id, **payload.model_dump())
+    db.add(environment)
+    db.commit()
+    db.refresh(environment)
+    return environment_to_dict(environment)
+
+
+@router.get("/projects/{project_id}/environments", tags=["environments"])
+def list_environments(project_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    _get_project(db, project_id)
+    environments = db.scalars(
+        select(Environment)
+        .where(Environment.project_id == project_id)
+        .order_by(Environment.created_at.desc())
+    ).all()
+    return {"environments": [environment_to_dict(item) for item in environments]}
+
+
+@router.get("/projects/{project_id}/environments/{environment_id}", tags=["environments"])
+def get_environment(
+    project_id: str, environment_id: str, db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    _get_project(db, project_id)
+    return environment_to_dict(_get_environment(db, project_id, environment_id))
+
+
+@router.patch("/projects/{project_id}/environments/{environment_id}", tags=["environments"])
+def update_environment(
+    project_id: str,
+    environment_id: str,
+    payload: EnvironmentUpdate,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    _get_project(db, project_id)
+    environment = _get_environment(db, project_id, environment_id)
+    changes = _clean_environment_update(payload)
+    if not changes:
+        raise AppError("Provide at least one environment field to update.", code="request_invalid")
+    for key, value in changes.items():
+        setattr(environment, key, value)
+    db.commit()
+    db.refresh(environment)
+    return environment_to_dict(environment)
+
+
+@router.delete(
+    "/projects/{project_id}/environments/{environment_id}",
+    status_code=204,
+    tags=["environments"],
+)
+def delete_environment(
+    project_id: str, environment_id: str, db: Session = Depends(get_db)
+) -> Response:
+    _get_project(db, project_id)
+    environment = _get_environment(db, project_id, environment_id)
+    db.delete(environment)
+    db.commit()
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# Request runs
+# ---------------------------------------------------------------------------
+
+
+def _result_to_dict(result: RunResult) -> dict[str, Any]:
+    return {
+        "operation_id": result.operation_id,
+        "method": result.method,
+        "path": result.path,
+        "status": result.status,
+        "http_status": result.http_status,
+        "latency_ms": result.latency_ms,
+        "content_type": result.content_type,
+        "violations": result.violations,
+        "auth_hint": result.auth_hint,
+        "error_code": result.error_code,
+        "error_message": result.error_message,
+        "observed_schema": result.observed_schema,
+    }
+
+
+def _run_to_dict(run: Run) -> dict[str, Any]:
+    return {
+        "id": run.id,
+        "project_id": run.project_id,
+        "spec_id": run.spec_id,
+        "environment_id": run.environment_id,
+        "base_url": run.base_url,
+        "status": run.status,
+        "summary": run.summary,
+        "error_message": run.error_message,
+        "created_at": _iso(run.created_at),
+        "started_at": _iso(run.started_at),
+        "finished_at": _iso(run.finished_at),
+        "results": [_result_to_dict(result) for result in run.results],
+    }
+
+
+def _run_summary(results: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "total": len(results),
+        "passed": sum(result["status"] == "passed" for result in results),
+        "failed": sum(result["status"] == "failed" for result in results),
+        "skipped": sum(result["status"] == "skipped" for result in results),
+    }
+
+
+@router.post("/runs", status_code=201, tags=["runs"])
+async def create_run(payload: RunCreate, db: Session = Depends(get_db)) -> dict[str, Any]:
+    spec = db.get(Spec, payload.spec_id)
+    environment = db.get(Environment, payload.environment_id)
+    if spec is None:
+        raise NotFoundError(f"Spec '{payload.spec_id}' not found.")
+    if environment is None:
+        raise NotFoundError(f"Environment '{payload.environment_id}' not found.")
+    if spec.project_id != environment.project_id:
+        raise AppError(
+            "The spec and environment must belong to the same project.",
+            code="run_invalid",
+            status_code=422,
+        )
+
+    operations = spec.operations or []
+    include = payload.include_operations
+    if include:
+        available = {str(operation.get("operation_id")) for operation in operations} | {
+            f"{operation.get('method')} {operation.get('path')}" for operation in operations
+        }
+        unknown = sorted(set(include) - available)
+        if unknown:
+            raise AppError(
+                f"Unknown operation selector: {unknown[0]}.", code="run_invalid", status_code=422
+            )
+
+    secret = payload.auth
+    auth = AuthContext(
+        auth_type=environment.auth_type,
+        header_name=environment.auth_header_name,
+        token=secret.token.get_secret_value() if secret and secret.token else None,
+        api_key=secret.api_key.get_secret_value() if secret and secret.api_key else None,
+        username=secret.username.get_secret_value() if secret and secret.username else None,
+        password=secret.password.get_secret_value() if secret and secret.password else None,
+    )
+
+    run = Run(
+        project_id=spec.project_id,
+        spec_id=spec.id,
+        environment_id=environment.id,
+        base_url=environment.base_url,
+        status="running",
+        include_operations=include,
+        parameter_values=payload.parameter_values,
+        started_at=datetime.now().astimezone(),
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+
+    try:
+        results = await run_operations(
+            operations,
+            base_url=environment.base_url,
+            resolved_document=spec.resolved_document,
+            include=include,
+            parameter_values=payload.parameter_values,
+            auth=auth,
+        )
+    except AppError:
+        db.delete(run)
+        db.commit()
+        raise
+    except Exception as exc:  # noqa: BLE001 — persist safe failure without internals
+        db.rollback()
+        run = db.get(Run, run.id)
+        if run is None:
+            raise AppError(
+                "Run could not be completed.", code="run_failed", status_code=502
+            ) from exc
+        run.status = "failed"
+        run.error_message = "Run could not be completed due to an internal execution error."
+        run.finished_at = datetime.now().astimezone()
+        db.commit()
+        return _run_to_dict(run)
+
+    for result in results:
+        db.add(
+            RunResult(
+                run_id=run.id,
+                operation_id=str(result.get("operation_id") or ""),
+                method=str(result.get("method") or "GET"),
+                path=str(result.get("path") or "/"),
+                status=result["status"],
+                http_status=result["http_status"],
+                latency_ms=result["latency_ms"],
+                content_type=result["content_type"],
+                violations=result["violations"],
+                auth_hint=result["auth_hint"],
+                error_code=result["error_code"],
+                error_message=result["error_message"],
+                observed_schema=result["observed_schema"],
+            )
+        )
+    run.summary = _run_summary(results)
+    run.status = "completed"
+    run.finished_at = datetime.now().astimezone()
+    db.commit()
+    db.refresh(run)
+    return _run_to_dict(run)
+
+
+@router.get("/runs/{run_id}", tags=["runs"])
+def get_run(run_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    run = db.get(Run, run_id)
+    if run is None:
+        raise NotFoundError(f"Run '{run_id}' not found.")
+    return _run_to_dict(run)
