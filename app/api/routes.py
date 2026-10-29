@@ -13,8 +13,9 @@ from sqlalchemy.orm import Session
 from app import __version__
 from app.core.config import get_settings
 from app.core.errors import AppError, NotFoundError, SpecInvalidError
-from app.db.models import Environment, Project, Run, RunResult, Spec
+from app.db.models import Baseline, Environment, Project, Run, RunResult, Spec
 from app.db.session import get_db
+from app.services.differ import Change, diff_observed, diff_operations
 from app.services.runner import AuthContext, run_operations
 from app.services.spec_import import fetch_document, import_document
 
@@ -528,3 +529,143 @@ def get_run(run_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
     if run is None:
         raise NotFoundError(f"Run '{run_id}' not found.")
     return _run_to_dict(run)
+
+
+def _change_payload(changes: list[Change]) -> dict[str, Any]:
+    return {
+        "summary": {
+            "total": len(changes),
+            "breaking": sum(change.severity == "breaking" for change in changes),
+            "warning": sum(change.severity == "warning" for change in changes),
+            "non_breaking": sum(change.severity == "non_breaking" for change in changes),
+        },
+        "changes": [change.to_dict() for change in changes],
+    }
+
+
+def _get_run(db: Session, run_id: str) -> Run:
+    run = db.get(Run, run_id)
+    if run is None:
+        raise NotFoundError(f"Run '{run_id}' not found.")
+    return run
+
+
+def _baseline_observations(run: Run) -> dict[str, Any]:
+    observations: dict[str, Any] = {}
+    for result in run.results:
+        if result.observed_schema:
+            key = f"{result.method} {result.path}"
+            observations[key] = result.observed_schema
+    return observations
+
+
+class BaselineCreate(BaseModel):
+    label: str = Field(default="baseline", min_length=1, max_length=120)
+
+    @field_validator("label")
+    @classmethod
+    def _strip_label(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("label must not be blank")
+        return value
+
+
+@router.post("/runs/{run_id}/baseline", status_code=201, tags=["baselines"])
+def save_baseline(
+    run_id: str,
+    payload: BaselineCreate | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Save only inferred response shapes, never response bodies or credentials."""
+    run = _get_run(db, run_id)
+    if run.status != "completed":
+        raise AppError("Only completed runs can be saved as baselines.", code="baseline_invalid")
+    observations = _baseline_observations(run)
+    if not observations:
+        raise AppError(
+            "This run has no observed JSON response shapes to save.", code="baseline_empty"
+        )
+    baseline = Baseline(
+        project_id=run.project_id,
+        run_id=run.id,
+        label=payload.label if payload else "baseline",
+        data={"observations": observations},
+    )
+    db.add(baseline)
+    db.commit()
+    db.refresh(baseline)
+    return {
+        "id": baseline.id,
+        "project_id": baseline.project_id,
+        "run_id": baseline.run_id,
+        "label": baseline.label,
+        "created_at": _iso(baseline.created_at),
+        "operation_count": len(observations),
+    }
+
+
+@router.get("/projects/{project_id}/baselines", tags=["baselines"])
+def list_baselines(project_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    _get_project(db, project_id)
+    baselines = db.scalars(
+        select(Baseline)
+        .where(Baseline.project_id == project_id)
+        .order_by(Baseline.created_at.desc())
+    ).all()
+    return {
+        "baselines": [
+            {
+                "id": baseline.id,
+                "project_id": baseline.project_id,
+                "run_id": baseline.run_id,
+                "label": baseline.label,
+                "created_at": _iso(baseline.created_at),
+                "operation_count": len((baseline.data or {}).get("observations", {})),
+            }
+            for baseline in baselines
+        ]
+    }
+
+
+@router.get("/runs/{run_id}/diff", tags=["diff"])
+def diff_run_against_baseline(
+    run_id: str, baseline_id: str, db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    run = _get_run(db, run_id)
+    if run.status != "completed":
+        raise AppError("Only completed runs can be compared to a baseline.", code="run_invalid")
+    baseline = db.get(Baseline, baseline_id)
+    if baseline is None or baseline.project_id != run.project_id:
+        raise NotFoundError(f"Baseline '{baseline_id}' not found.")
+    old = (baseline.data or {}).get("observations") or {}
+    new = _baseline_observations(run)
+    return _change_payload(diff_observed(old, new))
+
+
+class SpecsDiffRequest(BaseModel):
+    old_spec_id: str
+    new_spec_id: str
+
+
+@router.post("/projects/{project_id}/diff/specs", tags=["diff"])
+def diff_specs(
+    project_id: str, payload: SpecsDiffRequest, db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    _get_project(db, project_id)
+    old_spec = db.get(Spec, payload.old_spec_id)
+    new_spec = db.get(Spec, payload.new_spec_id)
+    if (
+        old_spec is None
+        or new_spec is None
+        or old_spec.project_id != project_id
+        or new_spec.project_id != project_id
+    ):
+        raise NotFoundError("One or both specs were not found in this project.")
+    changes = diff_operations(
+        old_spec.operations or [],
+        new_spec.operations or [],
+        old_document=old_spec.resolved_document,
+        new_document=new_spec.resolved_document,
+    )
+    return _change_payload(changes)

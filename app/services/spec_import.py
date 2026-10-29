@@ -341,6 +341,14 @@ def extract_operations(doc: dict[str, Any]) -> list[dict[str, Any]]:
                 body_info = {
                     "required": bool(request_body.get("required", False)),
                     "content_types": content_types,
+                    "schemas": {
+                        str(media): media_object.get("schema")
+                        for media, media_object in raw_content.items()
+                        if isinstance(media_object, dict)
+                        and isinstance(media_object.get("schema"), dict)
+                    }
+                    if isinstance(raw_content, dict)
+                    else {},
                 }
 
             op_params = op.get("parameters")

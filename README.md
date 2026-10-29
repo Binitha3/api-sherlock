@@ -1,17 +1,16 @@
 # API Sherlock
 
-<<<<<<< HEAD
 Find exactly what changed when an API integration breaks.
 
 API Sherlock imports an OpenAPI specification, runs real requests against a live
 API, validates every response against the contract, and reports the exact field
 that broke — before your users find out.
 
-> Status: **Phases 1–2** — project/spec import, environment management, request
-> execution and response-contract validation are implemented. Baselines, schema
-> diffs, reports and the CI CLI are later phases.
+> Status: **Phases 1–3** — project/spec import, environment management, safe
+> request execution, response-contract validation, saved response baselines, and
+> spec/live schema diffs are implemented. Reports and the CI CLI are Phase 4.
 
-## What it does (Phases 1–2)
+## What it does (Phases 1–3)
 
 - Create projects and list them.
 - Import an OpenAPI 3.0 / 3.1 document as a JSON/YAML **file upload** or from a
@@ -24,6 +23,10 @@ that broke — before your users find out.
   uninferable parameter or request body are marked skipped with a reason.
 - Validate response status, content type and JSON body schema; record exact
   violation paths, status, latency and concise authentication hints.
+- Save a run's inferred response shapes as a named baseline; raw response bodies
+  and auth credentials are not stored in baseline data.
+- Compare two imported specs or a new run against a saved baseline, with exact
+  paths and breaking, warning or non-breaking severity classifications.
 - `GET /health`.
 
 ## Stack
@@ -141,38 +144,20 @@ Dockerfile, docker-compose.yml
   imports and each API request; redirects are rechecked and cross-origin redirects
   are refused. `ALLOW_PRIVATE_HOSTS=true` is only for trusted local development.
 
+## Phase 3: baselines and diffs
+
+Save response shapes from a completed run with `POST /runs/{run_id}/baseline`
+(optionally pass `{"label":"v1"}`). List a project's baseline metadata with
+`GET /projects/{project_id}/baselines`. Compare a later run with
+`GET /runs/{run_id}/diff?baseline_id=<baseline_id>`, or compare two imported
+specifications with `POST /projects/{project_id}/diff/specs` and JSON fields
+`old_spec_id` and `new_spec_id`. Both diff responses include counts by severity
+and changes with exact paths. Inferred baseline schemas retain field names,
+types, nullability and array shape, not response values.
+
 ## Limitations (yet)
 
-- Baselines, schema diffing, reports, CLI and GitHub Actions integration remain
-  for Phases 3–4; the demo API and expanded end-to-end suite are Phase 5.
+- Reports, CLI and GitHub Actions integration remain for Phase 4.
 - External `$ref` targets are rejected — inline them or import one
   self-contained document.
 - Local `$ref` cycles are left as references in the stored document.
-=======
-Find exactly what changed in your API.
-
-API Sherlock imports an OpenAPI spec, runs real requests against a live API, compares each response to the contract, and reports breaking changes with the exact field that changed.
-
-## Status
-
-In development.
-
-- Landing page: done (`index.html`)
-- Backend (Python, FastAPI): in progress
-
-## Planned
-
-- Import and validate OpenAPI 3.0 and 3.1 specs
-- Run test requests and validate responses against the contract
-- Save a baseline and compare later runs against it
-- Classify changes as breaking, warning or safe
-- CLI for CI that fails a build on breaking changes
-
-## Run the landing page locally
-
-    python -m http.server 4187
-
-Then open http://127.0.0.1:4187/index.html
-
-Built by Binitha.
->>>>>>> 494ed5ee0a7aa8b5d8106158c93c2178afbf1ce1
