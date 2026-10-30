@@ -110,7 +110,11 @@ def client() -> TestClient:
     engine = get_engine()
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
-    with TestClient(app, raise_server_exceptions=False) as test_client:
+    with TestClient(
+        app,
+        raise_server_exceptions=False,
+        headers={"X-API-Key": os.environ["API_KEY"]},
+    ) as test_client:
         yield test_client
 
 

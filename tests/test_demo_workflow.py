@@ -61,6 +61,9 @@ def test_demo_v1_pass_and_v2_breaking_failures(client: TestClient, monkeypatch) 
         assert v1.json()["summary"]["failed"] == 0
         assert v1.json()["summary"]["passed"] == 4
 
+        baseline = client.post(f"/runs/{v1.json()['id']}/baseline", json={"label": "demo-v1"})
+        assert baseline.status_code == 201, baseline.text
+
         monkeypatch.setenv("DEMO_API_VERSION", "v2-breaking")
         breaking = client.post("/runs", json=run_payload)
         assert breaking.status_code == 201, breaking.text
@@ -73,3 +76,19 @@ def test_demo_v1_pass_and_v2_breaking_failures(client: TestClient, monkeypatch) 
     assert "body.active" in paths
     account = next(item for item in changed["results"] if item["operation_id"] == "getAccount")
     assert account["auth_hint"] and "API key" in account["auth_hint"]
+
+    diff = client.get(
+        f"/runs/{breaking.json()['id']}/diff",
+        params={"baseline_id": baseline.json()["id"]},
+    )
+    assert diff.status_code == 200, diff.text
+    body = diff.json()
+    assert body["summary"] == {"total": 6, "breaking": 5, "warning": 0, "non_breaking": 1}
+    assert {(change["path"], change["kind"], change["severity"]) for change in body["changes"]} == {
+        ("GET /users/{user_id} -> 200 -> body.name", "field_removed", "breaking"),
+        ("GET /users/{user_id} -> 200 -> body.active", "type_changed", "breaking"),
+        ("GET /users -> 200 -> body.items[].name", "field_removed", "breaking"),
+        ("GET /users -> 200 -> body.items[].active", "type_changed", "breaking"),
+        ("GET /account -> 200", "status_removed", "breaking"),
+        ("GET /account -> 401", "status_added", "non_breaking"),
+    }

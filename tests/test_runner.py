@@ -164,3 +164,57 @@ async def test_run_stops_at_response_size_limit(monkeypatch: pytest.MonkeyPatch)
             [operation], base_url="https://api.example.test", resolved_document={}
         )
     assert results[0]["error_code"] == "response_too_large"
+
+
+async def test_redirect_to_cloud_metadata_is_blocked() -> None:
+    operation = {
+        "operation_id": "metadata",
+        "method": "GET",
+        "path": "/",
+        "parameters": [],
+        "responses": {},
+    }
+    with respx.mock(assert_all_called=False) as router:
+        router.get("https://api.example.test/").mock(
+            return_value=httpx.Response(
+                302, headers={"location": "http://169.254.169.254/latest/meta-data/"}
+            )
+        )
+        results = await run_operations(
+            [operation], base_url="https://api.example.test", resolved_document={}
+        )
+    assert results[0]["error_code"] == "redirect_blocked"
+    assert results[0]["http_status"] == 302
+
+
+async def test_same_host_redirect_is_rechecked_against_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A host that resolves private after a redirect must not be contacted."""
+    from app.core import security
+
+    calls = {"count": 0}
+
+    def resolve(host: str, port: int) -> list[str]:
+        calls["count"] += 1
+        return ["93.184.216.34"] if calls["count"] <= 2 else ["10.0.0.7"]
+
+    monkeypatch.setattr(security, "resolve_target_ips", resolve)
+    operation = {
+        "operation_id": "redirect",
+        "method": "GET",
+        "path": "/",
+        "parameters": [],
+        "responses": {},
+    }
+    with respx.mock(assert_all_called=False) as router:
+        router.get("https://api.example.test/").mock(
+            return_value=httpx.Response(302, headers={"location": "/next"})
+        )
+        router.get("https://api.example.test/next").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+        results = await run_operations(
+            [operation], base_url="https://api.example.test", resolved_document={}
+        )
+    assert results[0]["error_code"] == "blocked_target"
+    assert "private network" in results[0]["error_message"]
+    assert calls["count"] == 3
