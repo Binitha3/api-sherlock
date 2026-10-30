@@ -1,0 +1,63 @@
+# Copy to .github/workflows/api-contract.yml
+#
+# Runs `sherlock check` on every pull request, fails the job when a breaking
+# contract change is found, and posts the Markdown report as the job summary.
+#
+# Setup:
+#   1. Commit `openapi.yaml` and a baseline saved with
+#      `sherlock baseline save --spec openapi.yaml --base-url <url> --output baseline.json`
+#   2. Add the target URL as the repository variable API_BASE_URL
+#      (Settings -> Secrets and variables -> Actions -> Variables).
+#   3. Add credentials as secrets: API_TOKEN (bearer) or API_KEY, and set
+#      SHERLOCK_AUTH_TYPE below to none, bearer, api_key_header or basic.
+
+name: API contract check
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    env:
+      SHERLOCK_AUTH_TYPE: bearer
+      SHERLOCK_TOKEN: ${{ secrets.API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install API Sherlock
+        run: pip install .
+
+      - name: Check the API contract
+        run: |
+          sherlock check \
+            --spec openapi.yaml \
+            --base-url "${{ vars.API_BASE_URL }}" \
+            --baseline baseline.json \
+            --fail-on breaking \
+            --format markdown \
+            --output sherlock-report.md
+
+      # Runs even when the check step fails, so reviewers always see the report.
+      - name: Post the report to the job summary
+        if: always()
+        run: |
+          if [ -f sherlock-report.md ]; then
+            cat sherlock-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sherlock-report
+          path: sherlock-report.md
+          if-no-files-found: ignore

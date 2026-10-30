@@ -16,6 +16,12 @@ from app.core.errors import AppError, NotFoundError, SpecInvalidError
 from app.db.models import Baseline, Environment, Project, Run, RunResult, Spec
 from app.db.session import get_db
 from app.services.differ import Change, diff_observed, diff_operations
+from app.services.reporter import (
+    build_report,
+    media_type,
+    observations_from_results,
+    render_report,
+)
 from app.services.runner import AuthContext, run_operations
 from app.services.spec_import import fetch_document, import_document
 
@@ -551,12 +557,7 @@ def _get_run(db: Session, run_id: str) -> Run:
 
 
 def _baseline_observations(run: Run) -> dict[str, Any]:
-    observations: dict[str, Any] = {}
-    for result in run.results:
-        if result.observed_schema:
-            key = f"{result.method} {result.path}"
-            observations[key] = result.observed_schema
-    return observations
+    return observations_from_results([_result_to_dict(result) for result in run.results])
 
 
 class BaselineCreate(BaseModel):
@@ -669,3 +670,71 @@ def diff_specs(
         new_document=new_spec.resolved_document,
     )
     return _change_payload(changes)
+
+
+# ---------------------------------------------------------------------------
+# Reports
+# ---------------------------------------------------------------------------
+
+
+def _report_baseline(db: Session, run: Run, baseline_id: str | None) -> Baseline | None:
+    """Explicit baseline, or the newest project baseline saved before this run."""
+    if baseline_id is not None:
+        baseline = db.get(Baseline, baseline_id)
+        if baseline is None or baseline.project_id != run.project_id:
+            raise NotFoundError(f"Baseline '{baseline_id}' not found.")
+        return baseline
+    return db.scalars(
+        select(Baseline)
+        .where(Baseline.project_id == run.project_id, Baseline.created_at <= run.created_at)
+        .order_by(Baseline.created_at.desc())
+        .limit(1)
+    ).first()
+
+
+@router.get("/runs/{run_id}/report", tags=["reports"])
+def run_report(
+    run_id: str,
+    format: Literal["json", "markdown", "html"] = "json",
+    baseline_id: str | None = None,
+    db: Session = Depends(get_db),
+) -> Any:
+    """Report a completed run: validation results, auth hints, latencies and,
+    when a baseline exists, its contract changes.
+
+    Without `baseline_id`, the newest baseline saved before this run is used so
+    a report never compares against a baseline created later.
+    """
+    run = _get_run(db, run_id)
+    if run.status != "completed":
+        raise AppError("Only completed runs can be reported.", code="run_invalid")
+
+    results = [_result_to_dict(result) for result in run.results]
+    baseline = _report_baseline(db, run, baseline_id)
+    changes: list[Change] = []
+    baseline_meta: dict[str, Any] | None = None
+    if baseline is not None:
+        old = (baseline.data or {}).get("observations") or {}
+        changes = diff_observed(old, _baseline_observations(run))
+        baseline_meta = {
+            "id": baseline.id,
+            "label": baseline.label,
+            "run_id": baseline.run_id,
+            "created_at": _iso(baseline.created_at),
+        }
+
+    report = build_report(
+        run=_run_to_dict(run),
+        results=results,
+        changes=changes,
+        baseline=baseline_meta,
+    )
+    if format == "json":
+        return report
+    body = render_report(report, format)
+    extension = "md" if format == "markdown" else "html"
+    return Response(
+        content=body,
+        media_type=media_type(format),
+        headers={"Content-Disposition": f'inline; filename="sherlock-report-{run.id}.{extension}"'},
+    )

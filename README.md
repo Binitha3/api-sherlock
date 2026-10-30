@@ -6,11 +6,12 @@ API Sherlock imports an OpenAPI specification, runs real requests against a live
 API, validates every response against the contract, and reports the exact field
 that broke — before your users find out.
 
-> Status: **Phases 1–3** — project/spec import, environment management, safe
-> request execution, response-contract validation, saved response baselines, and
-> spec/live schema diffs are implemented. Reports and the CI CLI are Phase 4.
+> Status: **Phases 1–4** — project/spec import, environment management, safe
+> request execution, response-contract validation, saved response baselines,
+> spec/live schema diffs, JSON/Markdown/HTML reports and a CI-ready CLI are
+> implemented. The expanded demo API and end-to-end/SSRF coverage finish in Phase 5.
 
-## What it does (Phases 1–3)
+## What it does (Phases 1–4)
 
 - Create projects and list them.
 - Import an OpenAPI 3.0 / 3.1 document as a JSON/YAML **file upload** or from a
@@ -27,13 +28,17 @@ that broke — before your users find out.
   and auth credentials are not stored in baseline data.
 - Compare two imported specs or a new run against a saved baseline, with exact
   paths and breaking, warning or non-breaking severity classifications.
+- Report a run as JSON, Markdown or HTML: severity counts, a change table,
+  failed operations with auth hints and violation paths, and latency statistics.
+- Check a live API from CI with `sherlock check`, without the server or database,
+  and fail the build on changes at or above a chosen severity.
 - `GET /health`.
 
 ## Stack
 
 FastAPI · Pydantic v2 · SQLAlchemy 2 + Alembic · PostgreSQL · httpx ·
-jsonschema (Draft 2020-12) · openapi-spec-validator · Typer (CLI, Phase 4) ·
-pytest + respx · Docker
+jsonschema (Draft 2020-12) · openapi-spec-validator · Typer · pytest + respx ·
+Docker
 
 ## Quick start (Docker)
 
@@ -129,7 +134,8 @@ app/api        routers
 app/core       config, security, errors
 app/db         models, session, Alembic base
 app/services   spec_import, runner, validator, differ, reporter
-app/cli.py     Typer CLI (Phase 4)
+app/cli.py     Typer CLI (local/CI mode, no server or database)
+examples/      GitHub Actions workflow for the CLI
 tests/         pytest suite
 demo_api/      sample target API (Phase 5)
 alembic/       migrations
@@ -155,9 +161,88 @@ specifications with `POST /projects/{project_id}/diff/specs` and JSON fields
 and changes with exact paths. Inferred baseline schemas retain field names,
 types, nullability and array shape, not response values.
 
+## Phase 4: reports and CI
+
+### Reports
+
+`GET /runs/{run_id}/report?format=json|markdown|html`
+
+A report contains operation pass/fail/skip counts, change counts by severity, a
+table of contract changes, failed operations with violation paths and auth
+hints, skipped operations and latency statistics (min, mean, p95, max). Response
+bodies and credentials are never part of a report.
+
+If `baseline_id` is omitted, the newest baseline saved **before** the run is
+used, so a report never compares against a baseline created later. `markdown`
+and `html` responses are documents with an inline `Content-Disposition`
+filename.
+
+```bash
+curl -s "http://localhost:8000/runs/<run_id>/report?format=markdown" -o report.md
+curl -s "http://localhost:8000/runs/<run_id>/report?baseline_id=<baseline_id>"
+```
+
+### CLI (local mode, no server or database)
+
+```bash
+pip install .
+sherlock baseline save --spec openapi.yaml --base-url https://api.example.com   --output baseline.json
+sherlock check --spec openapi.yaml --base-url https://api.example.com   --baseline baseline.json --fail-on breaking --format markdown --output report.md
+```
+
+Exit codes: `0` clean, `1` changes at or above `--fail-on`, `2` tool or
+configuration error. `--fail-on` accepts `breaking` (default), `warning` or
+`non_breaking`; `--format` accepts `markdown` (default), `json` or `html`.
+Without `--output` the report is printed to stdout; a one-line summary and the
+result always go to stderr.
+
+Secrets come from the environment only — never from flags, reports or logs:
+
+| Variable | Used for |
+|---|---|
+| `SHERLOCK_AUTH_TYPE` | `none` (default), `bearer`, `api_key_header`, `basic` |
+| `SHERLOCK_TOKEN` | Bearer token |
+| `SHERLOCK_API_KEY` | API key value |
+| `SHERLOCK_AUTH_HEADER` | API key header name (default `X-API-Key`) |
+| `SHERLOCK_USERNAME`, `SHERLOCK_PASSWORD` | Basic auth |
+
+`--allow-private-hosts` permits loopback/private targets for local development
+and is equivalent to `ALLOW_PRIVATE_HOSTS=true`. Baselines store inferred
+response shapes (field names, types, nullability), never response values.
+
+### Try it against the demo API
+
+```bash
+# Terminal 1 — v1 matches the spec
+uvicorn demo_api.main:app --port 8001
+
+# Terminal 2 — save the baseline from v1 (auth is only needed for /account)
+SHERLOCK_TOKEN=demo-token sherlock baseline save   --spec demo_api/openapi.yaml --base-url http://127.0.0.1:8001   --auth-type bearer --allow-private-hosts --output /tmp/baseline.json
+
+# Terminal 3 — start the breaking version elsewhere, then check it
+DEMO_API_VERSION=v2-breaking uvicorn demo_api.main:app --port 8002
+
+SHERLOCK_TOKEN=demo-token sherlock check   --spec demo_api/openapi.yaml --base-url http://127.0.0.1:8002   --auth-type bearer --allow-private-hosts   --baseline /tmp/baseline.json --format markdown --output /tmp/report.md
+# exit code 1, and the report names the removed `name` field and changed
+# `active` type, plus the auth-header switch on /account
+```
+
+### GitHub Actions
+
+[examples/github-actions.yml](examples/github-actions.yml) is ready to copy to
+`.github/workflows/api-contract.yml`. It installs the package, runs
+`sherlock check --fail-on breaking` on pull requests, writes the Markdown report
+to `$GITHUB_STEP_SUMMARY`, uploads it as an artifact and fails the job when a
+breaking change is found. Set the `API_BASE_URL` repository variable and the
+credential as a secret (`API_TOKEN` for bearer).
+
 ## Limitations (yet)
 
-- Reports, CLI and GitHub Actions integration remain for Phase 4.
+- API-key protection (`X-API-Key`) and CORS wiring are Phase 5; today the API
+  runs unauthenticated locally.
+- The CLI reports changes relative to a baseline file; it does not schedule
+  monitoring runs or post comments on pull requests by itself (the workflow
+  posts the report to the job summary).
 - External `$ref` targets are rejected — inline them or import one
   self-contained document.
 - Local `$ref` cycles are left as references in the stored document.

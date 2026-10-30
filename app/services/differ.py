@@ -402,17 +402,6 @@ def diff(
                     f"{path}.{name}: field removed.",
                 )
             )
-            if name in old_required:
-                changes.append(
-                    _change(
-                        f"{path}.{name}",
-                        "required_removed",
-                        "breaking" if context == "response" else "warning",
-                        True,
-                        False,
-                        f"{path}.{name}: required property removed.",
-                    )
-                )
         for name in sorted(new_props.keys() - old_props.keys()):
             required = name in new_required
             if context == "request" and required:
